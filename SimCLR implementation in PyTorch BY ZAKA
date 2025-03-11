@@ -1,0 +1,87 @@
+!pip install torch torchvision numpy matplotlib seaborn scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
+from torchvision import models
+from sklearn.decomposition import PCA
+
+transform = transforms.Compose([
+    transforms.RandomResizedCrop(32),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
+    transforms.RandomGrayscale(p=0.2),
+    transforms.ToTensor()
+])
+
+trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=256, shuffle=True, num_workers=2)
+
+class SimCLR(nn.Module):
+    def __init__(self, base_model, projection_dim=128):
+        super(SimCLR, self).__init__()
+        self.encoder = base_model
+        self.encoder.fc = nn.Identity()
+        self.projection_head = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, projection_dim)
+        )
+
+    def forward(self, x):
+        features = self.encoder(x)
+        projections = self.projection_head(features)
+        return projections
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+base_model = models.resnet18(weights=None)
+model = SimCLR(base_model).to(device)
+
+def contrastive_loss(features, temperature=0.5):
+    batch_size = features.shape[0]
+    features = F.normalize(features, dim=1)
+    similarity_matrix = torch.matmul(features, features.T)
+    mask = torch.eye(batch_size, dtype=torch.bool).to(features.device)
+    similarity_matrix.masked_fill_(mask, -float('inf'))
+    exp_sim = torch.exp(similarity_matrix / temperature)
+    loss = -torch.log(exp_sim.sum(dim=-1) + 1e-8).mean()
+    return loss
+
+optimizer = optim.Adam(model.parameters(), lr=0.0003)
+num_epochs = 10
+for epoch in range(num_epochs):
+    running_loss = 0.0
+    for images, _ in trainloader:
+        images = images.to(device)
+        projections = model(images)
+        loss = contrastive_loss(projections)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+    print(f"Epoch {epoch+1}, Loss: {running_loss / len(trainloader)}")
+
+model.eval()
+features_list = []
+with torch.no_grad():
+    for images, _ in trainloader:
+        images = images.to(device)
+        features = model.encoder(images)
+        features_list.append(features.cpu().numpy())
+
+features_np = np.concatenate(features_list)
+features_np = features_np[~np.isnan(features_np).any(axis=1)]
+
+pca = PCA(n_components=2)
+features_2d = pca.fit_transform(features_np)
+
+plt.figure(figsize=(8, 6))
+sns.scatterplot(x=features_2d[:, 0], y=features_2d[:, 1])
+plt.title("2D Projection of Learned Representations")
+plt.show()
